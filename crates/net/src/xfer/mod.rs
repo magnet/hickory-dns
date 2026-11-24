@@ -6,7 +6,7 @@
 
 use core::fmt::Display;
 use core::fmt::{self, Debug};
-use core::future::Future;
+use core::future::{Future, poll_fn};
 use core::marker::PhantomData;
 use core::net::SocketAddr;
 use core::pin::Pin;
@@ -26,7 +26,7 @@ use tracing::{debug, warn};
 
 use crate::error::NetError;
 use crate::proto::ProtoError;
-use crate::proto::op::{DnsRequest, DnsResponse, SerialMessage};
+use crate::proto::op::{DnsRequest, DnsResponse, DnsResponseDecoder, SerialMessage};
 use crate::runtime::Time;
 
 mod dns_exchange;
@@ -134,6 +134,39 @@ enum DnsResponseStreamInner {
 }
 
 type TimeoutFuture = BoxFuture<'static, Result<Result<DnsResponse, NetError>, io::Error>>;
+
+/// The number of questions and records decoded from a response before yielding to the executor.
+///
+/// Decoding a record takes a few hundred nanoseconds, so this keeps each poll that decodes a
+/// response short, even when the response holds hundreds of records.
+pub(crate) const DECODE_ENTRIES_PER_POLL: usize = 16;
+
+/// Decodes `buffer` as a response, yielding to the executor after every
+/// [`DECODE_ENTRIES_PER_POLL`] entries.
+pub(crate) async fn decode_response(buffer: Vec<u8>) -> Result<DnsResponse, ProtoError> {
+    let mut decoder = DnsResponseDecoder::new(buffer)?;
+    loop {
+        decoder.decode(DECODE_ENTRIES_PER_POLL)?;
+        if decoder.is_complete() {
+            return decoder.finish();
+        }
+        yield_now().await;
+    }
+}
+
+/// Wakes the current task and returns `Pending` once, so that the executor can run other tasks.
+async fn yield_now() {
+    let mut yielded = false;
+    poll_fn(|cx| {
+        if yielded {
+            return Poll::Ready(());
+        }
+        yielded = true;
+        cx.waker().wake_by_ref();
+        Poll::Pending
+    })
+    .await
+}
 
 /// Ignores the result of a send operation and logs and ignores errors
 fn ignore_send<M, T>(result: Result<M, mpsc::TrySendError<T>>) {
@@ -500,9 +533,11 @@ const DEFAULT_STREAM_BUFFER_SIZE: usize = 32;
 
 #[cfg(test)]
 mod tests {
-    use futures_util::StreamExt;
+    use futures_util::{FutureExt, StreamExt, task::noop_waker_ref};
 
-    use crate::proto::op::Message;
+    use crate::proto::op::{Message, Query};
+    use crate::proto::rr::rdata::SRV;
+    use crate::proto::rr::{Name, RData, Record, RecordType};
     use crate::runtime::TokioRuntimeProvider;
 
     use super::*;
@@ -538,5 +573,36 @@ mod tests {
             .expect("the response stream yields the send failure")
             .expect_err("a closed exchange cannot accept a request");
         assert!(matches!(err, NetError::ConnectionClosed));
+    }
+
+    /// A large response is decoded over several polls, so that it does not hold the executor.
+    #[test]
+    fn decode_response_yields_between_slices_of_a_large_response() {
+        let name = Name::from_ascii("_service._tcp.example.com.").unwrap();
+        let mut message = Message::query();
+        message.add_query(Query::new(name.clone(), RecordType::SRV));
+        for i in 0..64 {
+            let target = Name::from_ascii(format!("host-{i}.example.com.")).unwrap();
+            message.add_answer(Record::from_rdata(
+                name.clone(),
+                300,
+                RData::SRV(SRV::new(10, 10, 8080, target)),
+            ));
+        }
+        let buffer = message.into_response().to_vec().unwrap();
+
+        let mut cx = Context::from_waker(noop_waker_ref());
+        let mut decode = Box::pin(decode_response(buffer));
+        let mut polls = 1;
+        let response = loop {
+            match decode.poll_unpin(&mut cx) {
+                Poll::Ready(response) => break response.unwrap(),
+                Poll::Pending => polls += 1,
+            }
+        };
+
+        assert_eq!(response.answers.len(), 64);
+        // The query and 64 answers.
+        assert_eq!(polls, 65_usize.div_ceil(DECODE_ENTRIES_PER_POLL));
     }
 }

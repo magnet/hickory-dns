@@ -18,8 +18,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     error::ProtoError,
-    op::{Message, MessageType},
+    op::{Header, HeaderCounts, Message, MessageType, Metadata, Query, message::RecordSection},
     rr::{RData, RecordType, rdata::SOA, record::RecordRef},
+    serialize::binary::{BinDecodable, BinDecoder},
 };
 
 // TODO: this needs to have the IP addr of the remote system...
@@ -51,13 +52,11 @@ impl DnsResponse {
     /// Constructs a new DnsResponse by parsing a message from a buffer.
     ///
     /// Returns an error if the response message cannot be decoded.
+    ///
+    /// This decodes every record in one call. To decode a large response in bounded steps, use
+    /// [`DnsResponseDecoder`].
     pub fn from_buffer(buffer: Vec<u8>) -> Result<Self, ProtoError> {
-        let message = Message::from_vec(&buffer)?;
-        if message.metadata.message_type != MessageType::Response {
-            return Err(ProtoError::NotAResponse);
-        }
-
-        Ok(Self { message, buffer })
+        DnsResponseDecoder::new(buffer)?.finish()
     }
 
     /// Retrieves the SOA from the response. This will only exist if it was an authoritative response.
@@ -194,11 +193,110 @@ impl From<DnsResponse> for Message {
     }
 }
 
+/// Decodes a [`DnsResponse`] from a buffer a bounded number of entries at a time.
+///
+/// [`DnsResponse::from_buffer`] decodes the whole message at once, so its cost grows with the
+/// number of records in the response. An asynchronous caller can instead call
+/// [`DnsResponseDecoder::decode`] with a small limit and yield to its executor between calls, so
+/// that decoding a large response does not hold the executor thread for the whole message.
+pub struct DnsResponseDecoder {
+    buffer: Vec<u8>,
+    offset: usize,
+    metadata: Metadata,
+    counts: HeaderCounts,
+    queries: Vec<Query>,
+    answers: RecordSection,
+    authorities: RecordSection,
+    additionals: RecordSection,
+}
+
+impl DnsResponseDecoder {
+    /// Reads the header of the message in `buffer`.
+    ///
+    /// Returns an error if the header cannot be decoded or the message is not a response.
+    pub fn new(buffer: Vec<u8>) -> Result<Self, ProtoError> {
+        let mut decoder = BinDecoder::new(&buffer);
+        let Header { metadata, counts } = Header::read(&mut decoder)?;
+        if metadata.message_type != MessageType::Response {
+            return Err(ProtoError::NotAResponse);
+        }
+
+        let offset = decoder.index();
+        Ok(Self {
+            buffer,
+            offset,
+            metadata,
+            counts,
+            queries: Vec::with_capacity(Ord::min(usize::from(counts.queries), 8)),
+            answers: RecordSection::new(counts.answers.into(), false),
+            authorities: RecordSection::new(counts.authorities.into(), false),
+            additionals: RecordSection::new(counts.additionals.into(), true),
+        })
+    }
+
+    /// Decodes up to `max_entries` more questions and records, in message order.
+    ///
+    /// Returns the number of entries decoded. This is less than `max_entries` only when the
+    /// message has been fully decoded, after which [`Self::is_complete`] returns `true`.
+    pub fn decode(&mut self, max_entries: usize) -> Result<usize, ProtoError> {
+        let mut decoder = BinDecoder::new(&self.buffer);
+        decoder.read_slice(self.offset)?;
+
+        let op_code = self.metadata.op_code;
+        let mut decoded = 0;
+        while decoded < max_entries {
+            if self.queries.len() < usize::from(self.counts.queries) {
+                self.queries.push(Query::read(&mut decoder)?);
+            } else if let Some(section) = [
+                &mut self.answers,
+                &mut self.authorities,
+                &mut self.additionals,
+            ]
+            .into_iter()
+            .find(|section| !section.is_complete())
+            {
+                section.read(&mut decoder, op_code)?;
+            } else {
+                break;
+            }
+            decoded += 1;
+        }
+
+        self.offset = decoder.index();
+        Ok(decoded)
+    }
+
+    /// Whether every question and record counted in the header has been decoded.
+    pub fn is_complete(&self) -> bool {
+        self.queries.len() == usize::from(self.counts.queries)
+            && self.answers.is_complete()
+            && self.authorities.is_complete()
+            && self.additionals.is_complete()
+    }
+
+    /// Decodes any remaining entries and returns the response.
+    pub fn finish(mut self) -> Result<DnsResponse, ProtoError> {
+        self.decode(usize::MAX)?;
+        let message = Message::from_sections(
+            self.metadata,
+            self.queries,
+            self.answers,
+            self.authorities,
+            self.additionals,
+        );
+
+        Ok(DnsResponse {
+            message,
+            buffer: self.buffer,
+        })
+    }
+}
+
 #[cfg(all(test, any(feature = "std", feature = "no-std-rand")))]
 mod tests {
-    use crate::op::{Message, Query, ResponseCode};
+    use crate::op::{Edns, Message, Query, ResponseCode};
     use crate::rr::RData;
-    use crate::rr::rdata::{A, NS, SOA};
+    use crate::rr::rdata::{A, NS, SOA, SRV};
     use crate::rr::{Name, Record, RecordType};
 
     use super::*;
@@ -326,5 +424,83 @@ mod tests {
             DnsResponse::from_buffer(Message::query().to_vec().unwrap()).unwrap_err(),
             ProtoError::NotAResponse
         ));
+    }
+
+    fn srv_response(answers: u16) -> Message {
+        let name = Name::from_ascii("_service._tcp.example.com.").unwrap();
+        let mut message = Message::query();
+        message.add_query(Query::new(name.clone(), RecordType::SRV));
+        for i in 0..answers {
+            let target = Name::from_ascii(format!("host-{i}.example.com.")).unwrap();
+            message.add_answer(Record::from_rdata(
+                name.clone(),
+                300,
+                RData::SRV(SRV::new(10, 10, 8080, target)),
+            ));
+        }
+        message.add_authority(ns1_record());
+        message.add_additional(ns1_a());
+        message.set_edns(Edns::new());
+        message.into_response()
+    }
+
+    #[test]
+    fn decoder_matches_from_buffer_when_decoding_in_steps() {
+        let buffer = srv_response(40).to_vec().unwrap();
+        let expected = DnsResponse::from_buffer(buffer.clone()).unwrap();
+
+        for max_entries in [1, 3, 16, 64] {
+            let mut decoder = DnsResponseDecoder::new(buffer.clone()).unwrap();
+            let mut steps = 0;
+            while !decoder.is_complete() {
+                let decoded = decoder.decode(max_entries).unwrap();
+                assert!(decoded <= max_entries);
+                steps += 1;
+            }
+
+            // 1 query, 40 answers, 1 authority, 1 additional and the OPT record.
+            assert_eq!(steps, 44_usize.div_ceil(max_entries));
+            let response = decoder.finish().unwrap();
+            assert_eq!(*response, *expected);
+            assert_eq!(response.as_buffer(), expected.as_buffer());
+        }
+    }
+
+    #[test]
+    fn decoder_decodes_nothing_more_once_complete() {
+        let buffer = srv_response(2).to_vec().unwrap();
+        let mut decoder = DnsResponseDecoder::new(buffer).unwrap();
+
+        assert_eq!(decoder.decode(usize::MAX).unwrap(), 6);
+        assert!(decoder.is_complete());
+        assert_eq!(decoder.decode(16).unwrap(), 0);
+    }
+
+    #[test]
+    fn decoder_rejects_a_query() {
+        let mut message = Message::query();
+        message.add_query(Query::new(example(), RecordType::A));
+        let buffer = message.to_vec().unwrap();
+
+        assert!(matches!(
+            DnsResponseDecoder::new(buffer),
+            Err(ProtoError::NotAResponse)
+        ));
+    }
+
+    #[test]
+    fn decoder_reports_a_truncated_message() {
+        let mut buffer = srv_response(40).to_vec().unwrap();
+        buffer.truncate(buffer.len() / 2);
+        let mut decoder = DnsResponseDecoder::new(buffer).unwrap();
+
+        let result = loop {
+            match decoder.decode(16) {
+                Ok(_) if decoder.is_complete() => break Ok(()),
+                Ok(_) => continue,
+                Err(error) => break Err(error),
+            }
+        };
+        assert!(result.is_err());
     }
 }

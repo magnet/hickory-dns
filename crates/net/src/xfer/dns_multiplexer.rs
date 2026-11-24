@@ -25,9 +25,10 @@ use rand::RngExt;
 use tracing::debug;
 
 use super::{
-    BufDnsStreamHandle, DnsClientStream, DnsRequestSender, DnsResponseStream, ignore_send,
+    BufDnsStreamHandle, DECODE_ENTRIES_PER_POLL, DnsClientStream, DnsRequestSender,
+    DnsResponseStream, ignore_send,
 };
-use crate::proto::op::{DnsRequest, DnsResponse, SerialMessage};
+use crate::proto::op::{DnsRequest, DnsResponse, DnsResponseDecoder, SerialMessage};
 #[cfg(feature = "__dnssec")]
 use crate::proto::rr::{TSigVerifier, TSigner};
 use crate::{DnsStreamHandle, error::NetError, runtime::Time};
@@ -94,9 +95,58 @@ pub struct DnsMultiplexer<S> {
     #[cfg(feature = "__dnssec")]
     signer: Option<TSigner>,
     is_shutdown: bool,
+    /// A response that an earlier poll started decoding but did not finish.
+    decoding: Option<DnsResponseDecoder>,
 }
 
 impl<S: DnsClientStream> DnsMultiplexer<S> {
+    /// Decodes up to [`DECODE_ENTRIES_PER_POLL`] more entries of a response, and completes the
+    /// matching request once the response is fully decoded.
+    ///
+    /// Returns the decoder if the response is not fully decoded yet.
+    fn decode_response(&mut self, mut decoder: DnsResponseDecoder) -> Option<DnsResponseDecoder> {
+        if let Err(error) = decoder.decode(DECODE_ENTRIES_PER_POLL) {
+            debug!(%error, "error decoding message");
+            return None;
+        }
+
+        if !decoder.is_complete() {
+            return Some(decoder);
+        }
+
+        match decoder.finish() {
+            Ok(response) => self.complete_request(response),
+            Err(error) => debug!(%error, "error decoding message"),
+        }
+
+        None
+    }
+
+    /// Sends a decoded response to the request it answers.
+    fn complete_request(&mut self, response: DnsResponse) {
+        match self.active_requests.entry(response.id) {
+            Entry::Occupied(mut request_entry) => {
+                // send the response, complete the request...
+                let active_request = request_entry.get_mut();
+                #[cfg(feature = "__dnssec")]
+                if let Some(verifier) = &mut active_request.verifier {
+                    ignore_send(
+                        active_request.completion.try_send(
+                            verifier
+                                .verify(response.as_buffer())
+                                .map_err(NetError::from),
+                        ),
+                    );
+                } else {
+                    ignore_send(active_request.completion.try_send(Ok(response)));
+                }
+                #[cfg(not(feature = "__dnssec"))]
+                ignore_send(active_request.completion.try_send(Ok(response)));
+            }
+            Entry::Vacant(..) => debug!("unexpected request_id: {}", response.id),
+        }
+    }
+
     /// Spawns a new DnsMultiplexer Stream.
     ///
     /// This uses a default timeout of 5 seconds for all requests unless changed with
@@ -118,6 +168,7 @@ impl<S: DnsClientStream> DnsMultiplexer<S> {
             #[cfg(feature = "__dnssec")]
             signer: None,
             is_shutdown: false,
+            decoding: None,
         }
     }
 
@@ -302,6 +353,17 @@ impl<S: DnsClientStream> Stream for DnsMultiplexer<S> {
             return Poll::Ready(None);
         }
 
+        // A large response is decoded over several polls, so that it does not hold the executor
+        // for the whole message. Finish a response that an earlier poll started before reading
+        // more.
+        if let Some(decoder) = self.decoding.take() {
+            if let Some(decoder) = self.decode_response(decoder) {
+                self.decoding = Some(decoder);
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+        }
+
         // Collect all inbound requests, max 100 at a time for QoS
         //   by having a max we will guarantee that the client can't be DOSed in this loop
         // TODO: make the QoS configurable
@@ -311,29 +373,14 @@ impl<S: DnsClientStream> Stream for DnsMultiplexer<S> {
                 Poll::Ready(Some(Ok(buffer))) => {
                     messages_received = i + 1;
 
-                    //   deserialize or log decode_error
-                    match DnsResponse::from_buffer(buffer.into_parts().0) {
-                        Ok(response) => match self.active_requests.entry(response.id) {
-                            Entry::Occupied(mut request_entry) => {
-                                // send the response, complete the request...
-                                let active_request = request_entry.get_mut();
-                                #[cfg(feature = "__dnssec")]
-                                if let Some(verifier) = &mut active_request.verifier {
-                                    ignore_send(
-                                        active_request.completion.try_send(
-                                            verifier
-                                                .verify(response.as_buffer())
-                                                .map_err(NetError::from),
-                                        ),
-                                    );
-                                } else {
-                                    ignore_send(active_request.completion.try_send(Ok(response)));
-                                }
-                                #[cfg(not(feature = "__dnssec"))]
-                                ignore_send(active_request.completion.try_send(Ok(response)));
+                    match DnsResponseDecoder::new(buffer.into_parts().0) {
+                        Ok(decoder) => {
+                            if let Some(decoder) = self.decode_response(decoder) {
+                                self.decoding = Some(decoder);
+                                cx.waker().wake_by_ref();
+                                return Poll::Pending;
                             }
-                            Entry::Vacant(..) => debug!("unexpected request_id: {}", response.id),
-                        },
+                        }
                         // TODO: return src address for diagnostics
                         Err(error) => debug!(%error, "error decoding message"),
                     }
@@ -394,7 +441,7 @@ mod test {
 
     use super::*;
     use crate::proto::op::{DnsRequestOptions, Message, Query};
-    use crate::proto::rr::rdata::{NS, SOA};
+    use crate::proto::rr::rdata::{NS, SOA, SRV};
     use crate::proto::rr::{Name, RData, Record, RecordType};
     use crate::proto::serialize::binary::BinEncodable;
     use crate::xfer::{DnsClientStream, StreamReceiver};
@@ -575,15 +622,39 @@ mod test {
         )
     }
 
+    fn srv_query_answer(answers: usize) -> (DnsRequest, Vec<Message>) {
+        let name = Name::from_ascii("_service._tcp.example.com.").unwrap();
+
+        let mut request = Message::query();
+        request.metadata.recursion_desired = true;
+        request.add_query(Query::new(name.clone(), RecordType::SRV));
+
+        let mut response = request.clone().into_response();
+        for i in 0..answers {
+            let target = Name::from_ascii(format!("host-{i}.example.com.")).unwrap();
+            response.add_answer(Record::from_rdata(
+                name.clone(),
+                300,
+                RData::SRV(SRV::new(10, 10, 8080, target)),
+            ));
+        }
+        (
+            DnsRequest::new(request, DnsRequestOptions::default()),
+            vec![response],
+        )
+    }
+
+    /// Counts how many times it is woken.
+    struct Count(AtomicUsize);
+
+    impl Wake for Count {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     /// How many times one poll of a multiplexer with `ready` messages waiting asks to be woken.
     async fn wakes_after_one_poll(ready: usize) -> usize {
-        struct Count(AtomicUsize);
-        impl Wake for Count {
-            fn wake(self: Arc<Self>) {
-                self.0.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-
         let (query, answer) = a_query_answer();
         let answers = answer.into_iter().cycle().take(ready).collect();
         let mut multiplexer = get_mocked_multiplexer(answers).await;
@@ -662,5 +733,33 @@ mod test {
             response.iter().map(|m| m.answers.len()).sum::<usize>(),
             axfr_response().len()
         );
+    }
+
+    /// A large response is decoded over several polls, and each poll that stops early wakes the
+    /// task, since nothing else would.
+    #[tokio::test]
+    async fn test_multiplexer_decodes_a_large_response_over_several_polls() {
+        subscribe();
+        let (query, answer) = srv_query_answer(64);
+        let mut multiplexer = get_mocked_multiplexer(answer).await;
+        let mut response = multiplexer.send_message(query);
+
+        let count = Arc::new(Count(AtomicUsize::new(0)));
+        let waker = Waker::from(count.clone());
+        let mut cx = Context::from_waker(&waker);
+
+        let mut polls = 0;
+        let response = loop {
+            assert!(multiplexer.poll_next_unpin(&mut cx).is_pending());
+            polls += 1;
+            if let Poll::Ready(Some(response)) = response.poll_next_unpin(&mut cx) {
+                break response.unwrap();
+            }
+            assert_eq!(count.0.load(Ordering::Relaxed), polls);
+        };
+
+        assert_eq!(response.answers.len(), 64);
+        // The query and 64 answers.
+        assert_eq!(polls, 65_usize.div_ceil(DECODE_ENTRIES_PER_POLL));
     }
 }

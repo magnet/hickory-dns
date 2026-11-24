@@ -417,7 +417,6 @@ impl Message {
     /// RFC 8945 §5.1 says:
     ///  "This TSIG record MUST be the only TSIG RR in the message and MUST be the last record in
     ///   the additional data section."
-    #[cfg_attr(not(feature = "__dnssec"), allow(unused_mut))]
     #[expect(clippy::type_complexity)]
     pub fn read_records(
         decoder: &mut BinDecoder<'_>,
@@ -425,71 +424,12 @@ impl Message {
         is_additional: bool,
         op: OpCode,
     ) -> Result<(Vec<Record>, Option<Edns>, Option<Box<Record<TSIG>>>), DecodeError> {
-        let mut records = Vec::with_capacity(Ord::min(count, 8));
-        let mut edns = None;
-        let mut sig = None;
-
+        let mut section = RecordSection::new(count, is_additional);
         for _ in 0..count {
-            let record = Record::read(decoder)?;
-            if op != OpCode::Update
-                && record.record_type() != RecordType::OPT
-                && record.data.is_update()
-            {
-                return Err(DecodeError::InvalidEmptyRecord);
-            }
-
-            // There must be no additional records after a TSIG/SIG(0) record.
-            if sig.is_some() {
-                return Err(DecodeError::RecordAfterSig);
-            }
-
-            // OPT, SIG and TSIG records are only allowed in the additional section.
-            if !is_additional
-                && matches!(
-                    record.record_type(),
-                    RecordType::OPT | RecordType::SIG | RecordType::TSIG
-                )
-            {
-                return Err(DecodeError::RecordNotInAdditionalSection(
-                    record.record_type(),
-                ));
-            } else if !is_additional {
-                records.push(record);
-                continue;
-            }
-
-            match record.data {
-                #[cfg(feature = "__dnssec")]
-                RData::DNSSEC(DNSSECRData::SIG(_)) => {
-                    warn!(
-                        "message was SIG(0) signed, but support for SIG(0) message authentication was removed from hickory-dns"
-                    );
-                    records.push(record);
-                }
-                #[cfg(feature = "__dnssec")]
-                RData::TSIG(_) => {
-                    sig = Some(Box::new(
-                        record
-                            .map(|data| match data {
-                                RData::TSIG(tsig) => Some(tsig),
-                                _ => None,
-                            })
-                            .unwrap(/* match arm ensures correct type */),
-                    ))
-                }
-                RData::Update0(RecordType::OPT) | RData::OPT(_) => {
-                    if edns.is_some() {
-                        return Err(DecodeError::DuplicateEdns);
-                    }
-                    edns = Some((&record).into());
-                }
-                _ => {
-                    records.push(record);
-                }
-            }
+            section.read(decoder, op)?;
         }
 
-        Ok((records, edns, sig))
+        Ok((section.records, section.edns, section.sig))
     }
 
     /// Decodes a message from the buffer.
@@ -716,12 +656,108 @@ impl BinEncodable for Message {
     }
 }
 
+/// The records of one message section, read one at a time.
+///
+/// Applies the section rules of [`Message::read_records`] to each record as it is read, so that a
+/// section can be decoded across several calls.
+pub(crate) struct RecordSection {
+    records: Vec<Record>,
+    edns: Option<Edns>,
+    sig: Option<Box<Record<TSIG>>>,
+    count: usize,
+    read: usize,
+    is_additional: bool,
+}
+
+impl RecordSection {
+    pub(crate) fn new(count: usize, is_additional: bool) -> Self {
+        Self {
+            records: Vec::with_capacity(Ord::min(count, 8)),
+            edns: None,
+            sig: None,
+            count,
+            read: 0,
+            is_additional,
+        }
+    }
+
+    /// Whether every record counted in the header has been read.
+    pub(crate) fn is_complete(&self) -> bool {
+        self.read == self.count
+    }
+
+    /// Reads the next record of the section.
+    pub(crate) fn read(
+        &mut self,
+        decoder: &mut BinDecoder<'_>,
+        op: OpCode,
+    ) -> Result<(), DecodeError> {
+        let record = Record::read(decoder)?;
+        self.read += 1;
+        if op != OpCode::Update
+            && record.record_type() != RecordType::OPT
+            && record.data.is_update()
+        {
+            return Err(DecodeError::InvalidEmptyRecord);
+        }
+
+        // There must be no additional records after a TSIG/SIG(0) record.
+        if self.sig.is_some() {
+            return Err(DecodeError::RecordAfterSig);
+        }
+
+        // OPT, SIG and TSIG records are only allowed in the additional section.
+        if !self.is_additional
+            && matches!(
+                record.record_type(),
+                RecordType::OPT | RecordType::SIG | RecordType::TSIG
+            )
+        {
+            return Err(DecodeError::RecordNotInAdditionalSection(
+                record.record_type(),
+            ));
+        } else if !self.is_additional {
+            self.records.push(record);
+            return Ok(());
+        }
+
+        match record.data {
+            #[cfg(feature = "__dnssec")]
+            RData::DNSSEC(DNSSECRData::SIG(_)) => {
+                warn!(
+                    "message was SIG(0) signed, but support for SIG(0) message authentication was removed from hickory-dns"
+                );
+                self.records.push(record);
+            }
+            #[cfg(feature = "__dnssec")]
+            RData::TSIG(_) => {
+                self.sig = Some(Box::new(
+                    record
+                        .map(|data| match data {
+                            RData::TSIG(tsig) => Some(tsig),
+                            _ => None,
+                        })
+                        .unwrap(/* match arm ensures correct type */),
+                ))
+            }
+            RData::Update0(RecordType::OPT) | RData::OPT(_) => {
+                if self.edns.is_some() {
+                    return Err(DecodeError::DuplicateEdns);
+                }
+                self.edns = Some((&record).into());
+            }
+            _ => {
+                self.records.push(record);
+            }
+        }
+
+        Ok(())
+    }
+}
+
 impl<'r> BinDecodable<'r> for Message {
     fn read(decoder: &mut BinDecoder<'r>) -> Result<Self, DecodeError> {
-        let Header {
-            mut metadata,
-            counts,
-        } = Header::read(decoder)?;
+        let Header { metadata, counts } = Header::read(decoder)?;
 
         // TODO: return just header, and in the case of the rest of message getting an error.
         //  this could improve error detection while decoding.
@@ -733,32 +769,49 @@ impl<'r> BinDecodable<'r> for Message {
             queries.push(Query::read(decoder)?);
         }
 
-        let (answers, _, _) =
-            Self::read_records(decoder, counts.answers as usize, false, metadata.op_code)?;
-        let (authorities, _, _) = Self::read_records(
-            decoder,
-            counts.authorities as usize,
-            false,
-            metadata.op_code,
-        )?;
-        let (additionals, edns, signature) =
-            Self::read_records(decoder, counts.additionals as usize, true, metadata.op_code)?;
-
-        // need to grab error code from EDNS (which might have a higher value)
-        if let Some(edns) = &edns {
-            let high_response_code = edns.rcode_high();
-            metadata.merge_response_code(high_response_code);
+        let mut answers = RecordSection::new(counts.answers.into(), false);
+        let mut authorities = RecordSection::new(counts.authorities.into(), false);
+        let mut additionals = RecordSection::new(counts.additionals.into(), true);
+        for section in [&mut answers, &mut authorities, &mut additionals] {
+            while !section.is_complete() {
+                section.read(decoder, metadata.op_code)?;
+            }
         }
 
-        Ok(Self {
+        Ok(Self::from_sections(
             metadata,
             queries,
             answers,
             authorities,
             additionals,
-            signature,
-            edns,
-        })
+        ))
+    }
+}
+
+impl Message {
+    /// Assembles a message from its decoded parts.
+    pub(crate) fn from_sections(
+        mut metadata: Metadata,
+        queries: Vec<Query>,
+        answers: RecordSection,
+        authorities: RecordSection,
+        additionals: RecordSection,
+    ) -> Self {
+        // need to grab error code from EDNS (which might have a higher value)
+        if let Some(edns) = &additionals.edns {
+            let high_response_code = edns.rcode_high();
+            metadata.merge_response_code(high_response_code);
+        }
+
+        Self {
+            metadata,
+            queries,
+            answers: answers.records,
+            authorities: authorities.records,
+            additionals: additionals.records,
+            signature: additionals.sig,
+            edns: additionals.edns,
+        }
     }
 }
 

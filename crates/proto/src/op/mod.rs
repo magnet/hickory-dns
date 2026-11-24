@@ -23,7 +23,7 @@ mod dns_request;
 pub use dns_request::{DnsRequest, DnsRequestOptions};
 
 mod dns_response;
-pub use dns_response::DnsResponse;
+pub use dns_response::{DnsResponse, DnsResponseDecoder};
 
 mod edns;
 pub use edns::{DEFAULT_MAX_PAYLOAD_LEN, Edns, EdnsFlags};

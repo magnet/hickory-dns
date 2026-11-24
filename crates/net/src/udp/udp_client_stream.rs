@@ -23,7 +23,7 @@ use crate::proto::rr::TSigner;
 use crate::runtime::{DnsUdpSocket, RuntimeProvider, Spawn, Time};
 use crate::udp::MAX_RECEIVE_BUFFER_SIZE;
 use crate::udp::udp_stream::NextRandomUdpSocket;
-use crate::xfer::{DnsExchange, DnsRequestSender, DnsResponseStream};
+use crate::xfer::{DnsExchange, DnsRequestSender, DnsResponseStream, decode_response};
 
 /// A UDP client stream of DNS binary packets.
 ///
@@ -270,7 +270,7 @@ impl<P: RuntimeProvider> Request for UdpRequest<P> {
                 continue;
             }
 
-            let mut response = match DnsResponse::from_buffer(response_buffer) {
+            let mut response = match decode_response(response_buffer).await {
                 Ok(response) => response,
                 Err(error) => {
                     warn!(%error, "ignoring response we can't parse");
